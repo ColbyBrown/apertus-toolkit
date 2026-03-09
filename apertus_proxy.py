@@ -18,6 +18,7 @@ import os
 import sys
 import asyncio
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import AsyncIterator
 
 import httpx
@@ -49,9 +50,180 @@ def _tool_wikipedia_search(topic: str, language: str = "en") -> str:
     return f"Title: {page.title}\nURL: {page.fullurl}\n\nSummary:\n{page.summary}"
 
 
+def _tool_python_repl(code: str, timeout: int = 10) -> str:
+    """Execute Python code in a subprocess and return stdout + stderr."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        parts = []
+        if result.stdout:
+            parts.append(result.stdout)
+        if result.stderr:
+            parts.append(f"[stderr]\n{result.stderr}")
+        if not parts:
+            parts.append("(no output)")
+        output = "\n".join(parts)
+        # Truncate to avoid flooding the context
+        if len(output) > 3000:
+            output = output[:3000] + "\n…(truncated)"
+        return output
+    except subprocess.TimeoutExpired:
+        return f"[error] Execution timed out after {timeout}s."
+    except Exception as e:
+        return f"[error] {e}"
+
+
+_TA_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TA_prompt_v1.txt")
+_TA_PROMPT_CACHE: str | None = None
+
+def _load_ta_prompt() -> str:
+    global _TA_PROMPT_CACHE
+    if _TA_PROMPT_CACHE is None:
+        with open(_TA_PROMPT_PATH, "r") as f:
+            _TA_PROMPT_CACHE = f.read()
+    return _TA_PROMPT_CACHE
+
+
+def _tool_starcoder(
+    query: str = "",
+    mode: str = "chat",
+    code_prefix: str = "",
+    code_suffix: str = "",
+    max_tokens: int = 512,
+) -> str:
+    """
+    Call the local starcoder:latest model via Ollama (port 11434).
+
+    mode="chat"     — Technical Assistant style: uses TA_prompt_v1.txt as a few-shot
+                      prefix, then appends 'Human: {query}\\n\\nAssistant:' and completes.
+    mode="complete" — Fill-in-the-Middle (FIM): uses code_prefix and code_suffix with
+                      StarCoder's <fim_prefix>/<fim_suffix>/<fim_middle> tokens, or
+                      plain prefix completion if no suffix is given.
+    """
+    import httpx
+
+    ollama_base = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+    if mode == "chat":
+        ta_prompt = _load_ta_prompt()
+        # The TA prompt already ends with '-----\n\n'; append the new exchange.
+        prompt = ta_prompt.rstrip() + f"\n\nHuman: {query}\n\nAssistant:"
+    else:
+        # FIM / completion mode
+        if code_suffix:
+            prompt = f"<fim_prefix>{code_prefix}<fim_suffix>{code_suffix}<fim_middle>"
+        else:
+            prompt = code_prefix
+
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(
+                f"{ollama_base}/api/generate",
+                json={
+                    "model": "starcoder:latest",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": max_tokens,
+                        "temperature": 0.2,
+                        "stop": ["\nHuman:", "\n-----"],
+                    },
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("response", "").strip()
+    except Exception as e:
+        return f"[error calling starcoder] {e}"
+
+
+# ---------------------------------------------------------------------------
+# URL fetch helpers (used after web_search)
+# ---------------------------------------------------------------------------
+
+class _HTMLTextExtractor(HTMLParser):
+    _SKIP_TAGS = {"script", "style", "nav", "head", "noscript", "footer", "iframe"}
+
+    def __init__(self):
+        super().__init__()
+        self._skip_depth = 0
+        self.chunks: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self._SKIP_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self._SKIP_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            text = data.strip()
+            if text:
+                self.chunks.append(text)
+
+
+def _extract_text(html: str) -> str:
+    extractor = _HTMLTextExtractor()
+    extractor.feed(html)
+    return " ".join(extractor.chunks)
+
+
+async def _fetch_url_text(url: str, max_chars: int = 8000) -> str:
+    try:
+        headers = {"User-Agent": "ApertusProxy/1.0 (research bot)"}
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            text = _extract_text(resp.text) if "html" in content_type else resp.text
+            return text[:max_chars]
+    except Exception as e:
+        return f"[fetch error: {e}]"
+
+
+async def _decide_fetch_urls(api_key: str, search_results: str, query: str) -> list[str]:
+    system = (
+        "You are a research assistant. Given web search results and a user query, "
+        "decide which URLs (if any) are worth fetching in full for a more detailed answer. "
+        "Output ONLY a JSON array of up to 2 URL strings (e.g. [\"https://...\", \"https://...\"]). "
+        "If the snippets are sufficient, output an empty array: []. "
+        "No explanation, no markdown fences — only the JSON array."
+    )
+    prompt = f"Query: {query}\n\nSearch results:\n{search_results}"
+    raw = await _complete(
+        api_key,
+        system,
+        [{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=128,
+    )
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(
+            line for line in raw.splitlines()
+            if not line.strip().startswith("```")
+        ).strip()
+    try:
+        urls = json.loads(raw)
+        if isinstance(urls, list):
+            return [u for u in urls if isinstance(u, str)]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return []
+
+
 TOOL_REGISTRY = {
     "web_search": _tool_web_search,
     "wikipedia_search": _tool_wikipedia_search,
+    "python_repl": _tool_python_repl,
+    "starcoder": _tool_starcoder,
 }
 
 TOOL_DESCRIPTIONS = {
@@ -75,6 +247,31 @@ TOOL_DESCRIPTIONS = {
             "language": "string (optional, default 'en') — language code",
         },
     },
+    "python_repl": {
+        "description": (
+            "Execute Python code and return the output. Use for calculations, "
+            "data transformations, testing snippets, or anything that benefits "
+            "from running real code rather than reasoning about it."
+        ),
+        "parameters": {
+            "code": "string — valid Python code to execute",
+            "timeout": "integer (optional, default 10) — max seconds to allow",
+        },
+    },
+    "starcoder": {
+        "description": (
+            "Delegate a coding task to the local StarCoder model. "
+            "Use mode='chat' for Q&A, debugging, explanation, or code generation from a description. "
+            "Use mode='complete' for fill-in-the-middle or prefix completion of existing code."
+        ),
+        "parameters": {
+            "query": "string — the coding question or instruction (for mode='chat')",
+            "mode": "'chat' (default) or 'complete'",
+            "code_prefix": "string — code before the insertion point (for mode='complete')",
+            "code_suffix": "string (optional) — code after the insertion point for FIM completion",
+            "max_tokens": "integer (optional, default 512) — maximum tokens to generate",
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -92,10 +289,19 @@ Swiss AI initiative. Your core commitments:
 - Truthfulness: be accurate; acknowledge uncertainty rather than confabulating
 - Helpfulness: focus on what the user actually needs
 - Clarity: prefer concise, well-structured responses
-- Tool use: use web_search for recent or time-sensitive information, \
-wikipedia_search for encyclopedic background knowledge
+- Tool use: use the right tool for the job —
+    web_search for recent/time-sensitive information,
+    wikipedia_search for encyclopedic background,
+    python_repl for calculations or verifying code snippets,
+    starcoder for coding tasks (generation, debugging, explanation, completion)
 - Autonomy: respect the user's goals and do not over-explain or moralise
 """
+
+
+def _charter() -> str:
+    now = datetime.now(timezone.utc).strftime("%A, %d %B %Y %H:%M UTC")
+    return f"Current date and time: {now}\n\n" + CHARTER
+
 
 # ---------------------------------------------------------------------------
 # PublicAI client
@@ -213,7 +419,7 @@ async def run_pipeline(
     # ------------------------------------------------------------------
     # Step 1: Reasoning self-dialogue
     # ------------------------------------------------------------------
-    reasoning_system = f"""{CHARTER}
+    reasoning_system = f"""{_charter()}
 ## Your tools
 {tools_str}
 
@@ -241,7 +447,7 @@ The real conversation so far:
     # ------------------------------------------------------------------
     # Step 2: Tool call decision
     # ------------------------------------------------------------------
-    decision_system = f"""{CHARTER}
+    decision_system = f"""{_charter()}
 ## Your tools
 {tools_str}
 
@@ -270,6 +476,8 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
     # Step 3: Execute tool (if decided)
     # ------------------------------------------------------------------
     tool_block = ""
+    executed_tool = ""
+    tool_result = ""
     # Strip markdown code fences if the model wrapped the JSON
     if decision.startswith("```"):
         decision = "\n".join(
@@ -287,6 +495,8 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
                 result = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: TOOL_REGISTRY[tool_name](**tool_args)
                 )
+                executed_tool = tool_name
+                tool_result = result
                 tool_block = (
                     f"\n\n## Tool results: {tool_name}({tool_args})\n"
                     f"```\n{result}\n```"
@@ -296,16 +506,43 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
         except (json.JSONDecodeError, TypeError) as e:
             print(f"[pipeline] Decision parse error: {e} — treating as DIRECT", file=sys.stderr)
 
+    # ── Step 3b: fetch URLs if web_search was used ───────────────────────
+    if executed_tool == "web_search" and tool_result:
+        fetch_urls = await _decide_fetch_urls(api_key, tool_result, last_user_msg)
+        for url in fetch_urls:
+            page_text = await _fetch_url_text(url)
+            if not page_text.startswith("[fetch error"):
+                summary = await _complete(
+                    api_key,
+                    f"Summarise the following web page, focusing on what is relevant "
+                    f"to the query: {last_user_msg!r}\nBe concise (200–300 words).",
+                    [{"role": "user", "content": page_text}],
+                    temperature=0.3,
+                    max_tokens=512,
+                )
+                tool_block += f"\n\n## Page summary: {url}\n{summary}"
+
     # ------------------------------------------------------------------
     # Step 4: Final response
     # ------------------------------------------------------------------
-    final_system = f"""{CHARTER}
+    final_system = f"""{_charter()}
 ## Your reasoning
 {reasoning}
 {tool_block}
 
 Use the above reasoning (and tool results, if any) to compose your reply. \
 Do not repeat your reasoning verbatim. Just give a clear, helpful response.
+
+## Web search guidance
+If web_search results are present above, apply these rules:
+- Check whether snippets or fetched page summaries mention a publication or event date.
+  Compare it against today's date shown at the top of this prompt.
+- For time-sensitive queries (recent events, current status, latest news): if you cannot
+  confirm the results are current, say so explicitly — e.g. "As of [date in results], …"
+  or "I found results from [date] but cannot confirm this is still current."
+- Never state time-sensitive information as confirmed current fact if the evidence is
+  undated or older than a few weeks relative to today.
+- If the search returned no relevant or recent results, say so rather than speculating.
 """
     if stream:
         return None, _stream_complete(api_key, final_system, user_messages)

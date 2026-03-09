@@ -20,7 +20,10 @@ from apertus_proxy import (
     CHARTER,
     TOOL_DESCRIPTIONS,
     TOOL_REGISTRY,
+    _charter,
     _complete,
+    _decide_fetch_urls,
+    _fetch_url_text,
     _format_conversation,
     _stream_complete,
 )
@@ -45,7 +48,7 @@ async def _run_verbose_pipeline(api_key: str, user_messages: list):
     # ── Step 1: Reasoning ────────────────────────────────────────────────
     yield "<reasoning>\n⏳ *Thinking…*", None
 
-    reasoning_system = f"""{CHARTER}
+    reasoning_system = f"""{_charter()}
 ## Your tools
 {tools_str}
 
@@ -74,7 +77,7 @@ The real conversation so far:
     yield display, None
 
     # ── Step 2: Decision ─────────────────────────────────────────────────
-    decision_system = f"""{CHARTER}
+    decision_system = f"""{_charter()}
 ## Your tools
 {tools_str}
 
@@ -136,6 +139,39 @@ No explanation. No markdown fences. Output only the JSON or the word DIRECT.
                     + f"<tool>\n**🔧 {tool_name}**\n`{json.dumps(tool_args)}`\n\n"
                     + f"```\n{result_preview}\n```\n</tool>\n"
                 )
+
+                # ── Step 3b: decide & fetch URLs ─────────────────────────
+                if tool_name == "web_search":
+                    yield (
+                        display_prefix
+                        + f"<tool>\n**🔧 {tool_name}** (done)\n\n"
+                        + "⏳ *Deciding whether to fetch URLs…*\n</tool>\n", None
+                    )
+                    fetch_urls = await _decide_fetch_urls(api_key, result, last_user_msg)
+                    for url in fetch_urls:
+                        yield (
+                            display_prefix
+                            + f"<tool>\n⏳ *Fetching {url}…*\n</tool>\n", None
+                        )
+                        page_text = await _fetch_url_text(url)
+                        if not page_text.startswith("[fetch error"):
+                            summary = await _complete(
+                                api_key,
+                                f"Summarise the following web page, focusing on what is "
+                                f"relevant to the query: {last_user_msg!r}\n"
+                                f"Be concise (200–300 words).",
+                                [{"role": "user", "content": page_text}],
+                                temperature=0.3,
+                                max_tokens=512,
+                            )
+                            tool_block_for_system += f"\n\n## Page summary: {url}\n{summary}"
+                            display_prefix += (
+                                f"<tool>\n**🌐 Fetched:** {url}\n\n{summary}\n</tool>\n"
+                            )
+                        else:
+                            display_prefix += (
+                                f"<tool>\n⚠️ Could not fetch {url}: {page_text}\n</tool>\n"
+                            )
             else:
                 display_prefix += f"<tool>\n⚠️ Unknown tool requested: `{tool_name}`\n</tool>\n"
 
@@ -148,7 +184,7 @@ No explanation. No markdown fences. Output only the JSON or the word DIRECT.
     yield display_prefix + "\n⏳ *Generating response…*", None
 
     # ── Step 4: Stream final response ────────────────────────────────────
-    final_system = f"""{CHARTER}
+    final_system = f"""{_charter()}
 ## Your reasoning
 {reasoning}
 {tool_block_for_system}
