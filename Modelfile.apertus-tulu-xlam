@@ -1,0 +1,28 @@
+FROM /tmp/gguf-apertus/Apertus-8B-tulu-xlam-sft-q4_k_m.gguf
+
+TEMPLATE """<|im_start|>system
+{{ if .Tools }}You have access to the following tools:
+{{ .Tools }}
+
+To call a tool, respond with a JSON object wrapped in <tool_call> tags:
+<tool_call>
+{"name": "tool_name", "arguments": {"arg": "value"}}
+</tool_call>
+{{ end }}{{ .System }}<|im_end|>
+{{ range .Messages }}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .ToolCalls }}{{ range .ToolCalls }}<tool_call>
+{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+</tool_call>{{ end }}{{ else }}{{ .Content }}{{ end }}<|im_end|>
+{{ else if eq .Role "tool" }}<|im_start|>tool
+{{ .Content }}<|im_end|>
+{{ end }}{{ end }}<|im_start|>assistant
+"""
+
+SYSTEM "You are a helpful assistant. Think step by step before answering."
+
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|im_start|>"
+PARAMETER num_ctx 8192
