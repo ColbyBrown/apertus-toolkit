@@ -464,14 +464,24 @@ Label each turn clearly:
 The real conversation so far:
 {conv_str}
 """
-    reasoning = await _complete_remote(
-        api_key,
-        reasoning_system,
-        [{"role": "user", "content": f"Think through how to best respond to: {last_user_msg}"}],
-        temperature=0.7,
-        max_tokens=1024,
-    )
-    print(f"[pipeline] Reasoning complete ({len(reasoning)} chars from 70B)", file=sys.stderr)
+    try:
+        reasoning = await _complete_remote(
+            api_key,
+            reasoning_system,
+            [{"role": "user", "content": f"Think through how to best respond to: {last_user_msg}"}],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        print(f"[pipeline] Reasoning complete ({len(reasoning)} chars from 70B)", file=sys.stderr)
+    except Exception as e:
+        print(f"[pipeline] PublicAI reasoning failed ({e}), falling back to local model", file=sys.stderr)
+        reasoning = await _complete_local(
+            reasoning_system,
+            [{"role": "user", "content": f"Think through how to best respond to: {last_user_msg}"}],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        print(f"[pipeline] Reasoning complete ({len(reasoning)} chars from local fallback)", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Step 2: Tool call decision  →  local 8B
