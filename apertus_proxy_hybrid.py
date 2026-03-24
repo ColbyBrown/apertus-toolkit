@@ -1,16 +1,16 @@
 """
 Hybrid Ollama-compatible proxy for Apertus.
 
-Reasoning step  → PublicAI (swiss-ai/apertus-70b-instruct)  [high-quality deliberation]
-Everything else → local apertus-tulu-xlam:8b via Ollama     [fast, private execution]
+Reasoning + tool use → local apertus-tulu-xlam:8b via Ollama  [fine-tuned for this task]
+Final response draft → PublicAI (swiss-ai/apertus-70b-instruct) [high-quality generation]
 
 Pipeline:
-  1. Reasoning self-dialogue   → PublicAI 70B
+  1. Reasoning self-dialogue   → local 8B
   2. Tool-call decision        → local 8B
   3. Tool execution            → Python (no LLM)
      3a. URL-fetch decision    → local 8B
      3b. Page summarisation    → local 8B
-  4. Final response            → local 8B (streaming or non-streaming)
+  4. Final response            → PublicAI 70B (streaming or non-streaming)
 
 Usage:
     PUBLICAI_API_KEY=your_key python apertus_proxy_local.py
@@ -30,6 +30,19 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def _ensure_protocol(url: str) -> str:
+    """Ensure URL has http:// or https:// protocol prefix."""
+    if not url or not isinstance(url, str):
+        return "http://localhost:11434"
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
 
 # ---------------------------------------------------------------------------
 # Tool implementations
@@ -109,7 +122,7 @@ def _tool_starcoder(
                       StarCoder's <fim_prefix>/<fim_suffix>/<fim_middle> tokens, or
                       plain prefix completion if no suffix is given.
     """
-    ollama_base = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    ollama_base = _ensure_protocol(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
 
     if mode == "chat":
         ta_prompt = _load_ta_prompt()
@@ -177,6 +190,10 @@ def _extract_text(html: str) -> str:
 
 async def _fetch_url_text(url: str, max_chars: int = 8000) -> str:
     try:
+        # Ensure URL has a protocol
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        
         headers = {"User-Agent": "ApertusProxy/1.0 (research bot)"}
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
@@ -250,7 +267,7 @@ TOOL_DESCRIPTIONS = {
 PUBLICAI_BASE = "https://api.publicai.co/v1"
 UPSTREAM_MODEL = "swiss-ai/apertus-70b-instruct"   # used only for reasoning
 LOCAL_MODEL = "apertus-tulu-xlam:8b"               # used for everything else
-OLLAMA_MODEL_NAME = "apertus-local:8b"             # name advertised to Ollama clients
+OLLAMA_MODEL_NAME = "apertus-hybrid"             # name advertised to Ollama clients
 
 CHARTER = """\
 You are Apertus, an open, capable, and honest AI assistant developed as part of the \
@@ -291,7 +308,7 @@ async def _complete_remote(
     temperature: float = 0.7,
     max_tokens: int = 2048,
 ) -> str:
-    """Non-streaming call to PublicAI (used for the reasoning step only)."""
+    """Non-streaming call to PublicAI (used for the final response step)."""
     full_messages = [{"role": "system", "content": system}] + messages
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -312,12 +329,54 @@ async def _complete_remote(
         return data["choices"][0]["message"]["content"]
 
 
+async def _stream_complete_remote(
+    api_key: str,
+    system: str,
+    messages: list[dict],
+    temperature: float = 0.8,
+    max_tokens: int = 4096,
+) -> AsyncIterator[str]:
+    """Streaming call to PublicAI (used for the final response step); yields text deltas."""
+    full_messages = [{"role": "system", "content": system}] + messages
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "ApertusProxy/1.0",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": UPSTREAM_MODEL,
+        "messages": full_messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST", f"{PUBLICAI_BASE}/chat/completions", headers=headers, json=payload
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk["choices"][0]["delta"].get("content", "")
+                    if delta:
+                        yield delta
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
+
 # ---------------------------------------------------------------------------
 # Backend: local Ollama (all non-reasoning steps)
 # ---------------------------------------------------------------------------
 
 def _ollama_base() -> str:
-    return os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    return _ensure_protocol(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
 
 
 async def _complete_local(
@@ -441,60 +500,17 @@ async def run_pipeline(
     last_user_msg = next(
         (m["content"] for m in reversed(user_messages) if m["role"] == "user"), ""
     )
-    conv_str = _format_conversation(user_messages)
     tools_str = json.dumps(TOOL_DESCRIPTIONS, indent=2)
 
     # ------------------------------------------------------------------
-    # Step 1: Reasoning self-dialogue  →  PublicAI 70B
-    # ------------------------------------------------------------------
-    reasoning_system = f"""{_charter()}
-## Your tools
-{tools_str}
-
-## Task
-You are engaging in an internal reasoning dialogue BEFORE replying to the user.
-Play both sides of a short conversation (2-4 exchanges) between an inner USER \
-(who asks clarifying questions about the task) and an inner ASSISTANT (who reasons \
-through the best approach, including whether any tool should be called and why).
-
-Label each turn clearly:
-  INNER USER: ...
-  INNER ASSISTANT: ...
-
-The real conversation so far:
-{conv_str}
-"""
-    try:
-        reasoning = await _complete_remote(
-            api_key,
-            reasoning_system,
-            [{"role": "user", "content": f"Think through how to best respond to: {last_user_msg}"}],
-            temperature=0.7,
-            max_tokens=1024,
-        )
-        print(f"[pipeline] Reasoning complete ({len(reasoning)} chars from 70B)", file=sys.stderr)
-    except Exception as e:
-        print(f"[pipeline] PublicAI reasoning failed ({e}), falling back to local model", file=sys.stderr)
-        reasoning = await _complete_local(
-            reasoning_system,
-            [{"role": "user", "content": f"Think through how to best respond to: {last_user_msg}"}],
-            temperature=0.7,
-            max_tokens=1024,
-        )
-        print(f"[pipeline] Reasoning complete ({len(reasoning)} chars from local fallback)", file=sys.stderr)
-
-    # ------------------------------------------------------------------
-    # Step 2: Tool call decision  →  local 8B
+    # Step 1: Tool call decision  →  local 8B (native reasoning)
     # ------------------------------------------------------------------
     decision_system = f"""{_charter()}
 ## Your tools
 {tools_str}
 
-## Your reasoning so far
-{reasoning}
-
 ## Task
-Decide: should a tool be called, or should you respond directly?
+Decide: should a tool be called to answer the user's message, or should you respond directly?
 
 - If a tool should be called, output ONLY valid JSON with exactly these keys:
   {{"tool": "<tool_name>", "args": {{<key>: <value>, ...}}}}
@@ -504,7 +520,7 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
 """
     decision_raw = await _complete_local(
         decision_system,
-        [{"role": "user", "content": "Tool call or direct response?"}],
+        user_messages,
         temperature=0.1,
         max_tokens=256,
     )
@@ -560,15 +576,10 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
                 tool_block += f"\n\n## Page summary: {url}\n{summary}"
 
     # ------------------------------------------------------------------
-    # Step 4: Final response  →  local 8B
+    # Step 3: Final response  →  PublicAI 70B
     # ------------------------------------------------------------------
-    final_system = f"""{_charter()}
-## Your reasoning
-{reasoning}
-{tool_block}
-
-Use the above reasoning (and tool results, if any) to compose your reply. \
-Do not repeat your reasoning verbatim. Just give a clear, helpful response.
+    tool_section = f"\n\n## Tool results\n{tool_block}" if tool_block else ""
+    final_system = f"""{_charter()}{tool_section}
 
 ## Web search guidance
 If web_search results are present above, apply these rules:
@@ -582,9 +593,9 @@ If web_search results are present above, apply these rules:
 - If the search returned no relevant or recent results, say so rather than speculating.
 """
     if stream:
-        return None, _stream_complete_local(final_system, user_messages)
+        return None, _stream_complete_remote(api_key, final_system, user_messages)
     else:
-        text = await _complete_local(final_system, user_messages, temperature=0.8, max_tokens=4096)
+        text = await _complete_remote(api_key, final_system, user_messages, temperature=0.8, max_tokens=4096)
         return text, None
 
 
@@ -597,6 +608,12 @@ app = FastAPI(title="Apertus Local Hybrid Proxy")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@app.get("/")
+async def root():
+    """Ollama GET / — health check."""
+    return "Ollama is running"
 
 
 @app.get("/api/tags")
@@ -712,6 +729,28 @@ async def generate(request: Request):
         })
 
 
+@app.post("/api/show")
+async def show_model(request: Request):
+    """Ollama POST /api/show — returns model details."""
+    return JSONResponse({
+        "modelfile": f"FROM {LOCAL_MODEL}",
+        "parameters": "",
+        "template": "",
+        "details": {
+            "parent_model": LOCAL_MODEL,
+            "format": "gguf",
+            "family": "llama",
+            "families": ["llama"],
+            "parameter_size": "8B",
+            "quantization_level": "Q4_K_M",
+        },
+        "model_info": {
+            "general.architecture": "llama",
+            "general.parameter_count": 8_000_000_000,
+        },
+    })
+
+
 @app.get("/api/version")
 async def version():
     return {"version": "0.1.0"}
@@ -724,6 +763,6 @@ async def version():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 11436))
     print(f"Starting Apertus local hybrid proxy on port {port}", file=sys.stderr)
-    print(f"Reasoning model : {UPSTREAM_MODEL} (PublicAI)", file=sys.stderr)
-    print(f"Execution model : {LOCAL_MODEL} (Ollama local)", file=sys.stderr)
+    print(f"Reasoning + tools : {LOCAL_MODEL} (Ollama local)", file=sys.stderr)
+    print(f"Final response    : {UPSTREAM_MODEL} (PublicAI)", file=sys.stderr)
     uvicorn.run(app, host="0.0.0.0", port=port)

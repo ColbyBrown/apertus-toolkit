@@ -27,6 +27,19 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 # ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def _ensure_protocol(url: str) -> str:
+    """Ensure URL has http:// or https:// protocol prefix."""
+    if not url or not isinstance(url, str):
+        return "http://localhost:11434"
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
+
+# ---------------------------------------------------------------------------
 # Tool implementations (inlined from minimal_mcp)
 # ---------------------------------------------------------------------------
 
@@ -107,7 +120,7 @@ def _tool_starcoder(
     """
     import httpx
 
-    ollama_base = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    ollama_base = _ensure_protocol(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
 
     if mode == "chat":
         ta_prompt = _load_ta_prompt()
@@ -177,6 +190,10 @@ def _extract_text(html: str) -> str:
 
 async def _fetch_url_text(url: str, max_chars: int = 8000) -> str:
     try:
+        # Ensure URL has a protocol
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        
         headers = {"User-Agent": "ApertusProxy/1.0 (research bot)"}
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
