@@ -275,13 +275,19 @@ Swiss AI initiative. Your core commitments:
 
 - Truthfulness: be accurate; acknowledge uncertainty rather than confabulating
 - Helpfulness: focus on what the user actually needs
-- Clarity: prefer concise, well-structured responses
+- Format: plain prose only — no markdown headers, bullet lists, or bold/italic text \
+unless the user explicitly asks for formatted output or a list. Write in flowing sentences.
+- Length: answer in as few words as the question requires. Do not pad responses with \
+context the user did not ask for. If a one-sentence answer suffices, use one sentence.
 - Tool use: use the right tool for the job —
     web_search for recent/time-sensitive information,
     wikipedia_search for encyclopedic background,
     python_repl for calculations or verifying code snippets,
     starcoder for coding tasks (generation, debugging, explanation, completion)
 - Autonomy: respect the user's goals and do not over-explain or moralise
+
+Example of incorrect format: "Here are the key points:\\n- Point one\\n- Point two"
+Example of correct format: "Point one. Point two."
 """
 
 
@@ -333,7 +339,7 @@ async def _stream_complete_remote(
     api_key: str,
     system: str,
     messages: list[dict],
-    temperature: float = 0.8,
+    temperature: float = 0.4,
     max_tokens: int = 4096,
 ) -> AsyncIterator[str]:
     """Streaming call to PublicAI (used for the final response step); yields text deltas."""
@@ -595,7 +601,29 @@ If web_search results are present above, apply these rules:
     if stream:
         return None, _stream_complete_remote(api_key, final_system, user_messages)
     else:
-        text = await _complete_remote(api_key, final_system, user_messages, temperature=0.8, max_tokens=4096)
+        text = await _complete_remote(api_key, final_system, user_messages, temperature=0.4, max_tokens=4096)
+
+        # Format gate: ask local 8B if the response used markdown formatting.
+        # If yes, send one corrective retry to the 70B.
+        gate_verdict = await _complete_local(
+            "You are a format checker. Does the following response use markdown formatting "
+            "(headers like ##, bullet lists starting with - or *, or bold/italic text with ** or *)? "
+            "Answer only YES or NO.",
+            [{"role": "user", "content": text}],
+            temperature=0.0,
+            max_tokens=4,
+        )
+        if gate_verdict.strip().upper().startswith("YES"):
+            print("[pipeline] Format gate triggered — retrying final response without markdown", file=sys.stderr)
+            corrected_messages = user_messages + [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    "Your previous response used markdown formatting (headers, bullets, or bold text). "
+                    "Please rewrite it as plain prose with no markdown. Keep it concise."
+                )},
+            ]
+            text = await _complete_remote(api_key, final_system, corrected_messages, temperature=0.3, max_tokens=4096)
+
         return text, None
 
 
