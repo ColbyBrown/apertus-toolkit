@@ -24,7 +24,10 @@ from typing import AsyncIterator
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
 import uvicorn
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -460,6 +463,10 @@ The real conversation so far:
         temperature=0.7,
         max_tokens=1024,
     )
+    print("\n" + "="*60, file=sys.stderr)
+    print("[pipeline] REASONING:", file=sys.stderr)
+    print(reasoning, file=sys.stderr)
+    print("="*60, file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Step 2: Tool call decision
@@ -488,6 +495,7 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
         max_tokens=256,
     )
     decision = decision_raw.strip()
+    print(f"\n[pipeline] TOOL DECISION: {decision}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Step 3: Execute tool (if decided)

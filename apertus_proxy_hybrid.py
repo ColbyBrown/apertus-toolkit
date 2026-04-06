@@ -29,7 +29,10 @@ from typing import AsyncIterator
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
 import uvicorn
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -208,7 +211,6 @@ async def _fetch_url_text(url: str, max_chars: int = 8000) -> str:
 TOOL_REGISTRY = {
     "web_search": _tool_web_search,
     "wikipedia_search": _tool_wikipedia_search,
-    "python_repl": _tool_python_repl,
     "starcoder": _tool_starcoder,
 }
 
@@ -233,17 +235,6 @@ TOOL_DESCRIPTIONS = {
             "language": "string (optional, default 'en') — language code",
         },
     },
-    "python_repl": {
-        "description": (
-            "Execute Python code and return the output. Use for calculations, "
-            "data transformations, testing snippets, or anything that benefits "
-            "from running real code rather than reasoning about it."
-        ),
-        "parameters": {
-            "code": "string — valid Python code to execute",
-            "timeout": "integer (optional, default 10) — max seconds to allow",
-        },
-    },
     "starcoder": {
         "description": (
             "Delegate a coding task to the local StarCoder model. "
@@ -265,8 +256,8 @@ TOOL_DESCRIPTIONS = {
 # ---------------------------------------------------------------------------
 
 PUBLICAI_BASE = "https://api.publicai.co/v1"
-UPSTREAM_MODEL = "swiss-ai/apertus-70b-instruct"   # used only for reasoning
-LOCAL_MODEL = "apertus-tulu-xlam:8b"               # used for everything else
+UPSTREAM_MODEL = "swiss-ai/apertus-70b-instruct"   # used for final response 
+LOCAL_MODEL = "qwen3:8b"                           # used for reasoning
 OLLAMA_MODEL_NAME = "apertus-hybrid"             # name advertised to Ollama clients
 
 CHARTER = """\
@@ -282,7 +273,6 @@ context the user did not ask for. If a one-sentence answer suffices, use one sen
 - Tool use: use the right tool for the job —
     web_search for recent/time-sensitive information,
     wikipedia_search for encyclopedic background,
-    python_repl for calculations or verifying code snippets,
     starcoder for coding tasks (generation, debugging, explanation, completion)
 - Autonomy: respect the user's goals and do not over-explain or moralise
 
@@ -297,7 +287,7 @@ def _charter() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backend: PublicAI (reasoning only)
+# Backend: PublicAI
 # ---------------------------------------------------------------------------
 
 def _get_api_key() -> str:
@@ -305,6 +295,36 @@ def _get_api_key() -> str:
     if not key:
         raise HTTPException(status_code=500, detail="PUBLICAI_API_KEY env var not set")
     return key
+
+
+def _truncate_on_repetition(text: str, window: int = 5) -> str:
+    """
+    Detect paragraph-level repetition and truncate at the first repeated block.
+    Splits on double-newlines; if any paragraph seen before reappears, stop there.
+    Falls back to sentence-level detection using a sliding window.
+    """
+    # Paragraph-level check
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    seen: set[str] = set()
+    for i, para in enumerate(paragraphs):
+        if para in seen:
+            truncated = "\n\n".join(paragraphs[:i])
+            print(f"[pipeline] Repetition detected at paragraph {i} — truncating", file=sys.stderr)
+            return truncated
+        seen.add(para)
+
+    # Sentence-level sliding-window check
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    if len(sentences) > window * 2:
+        for i in range(window, len(sentences)):
+            recent = tuple(sentences[i - window:i])
+            for j in range(i - window):
+                if tuple(sentences[j:j + window]) == recent:
+                    truncated = " ".join(sentences[:i - window + 1])
+                    print(f"[pipeline] Sentence-level repetition at index {i} — truncating", file=sys.stderr)
+                    return truncated
+    return text
 
 
 async def _complete_remote(
@@ -326,13 +346,14 @@ async def _complete_remote(
         "messages": full_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "frequency_penalty": 0.4,
         "stream": False,
     }
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(f"{PUBLICAI_BASE}/chat/completions", headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        return _truncate_on_repetition(data["choices"][0]["message"]["content"])
 
 
 async def _stream_complete_remote(
@@ -354,8 +375,10 @@ async def _stream_complete_remote(
         "messages": full_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "frequency_penalty": 0.4,
         "stream": True,
     }
+    accumulated = ""
     async with httpx.AsyncClient(timeout=120.0) as client:
         async with client.stream(
             "POST", f"{PUBLICAI_BASE}/chat/completions", headers=headers, json=payload
@@ -371,18 +394,41 @@ async def _stream_complete_remote(
                 try:
                     chunk = json.loads(data_str)
                     delta = chunk["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        yield delta
+                    if not delta:
+                        continue
+                    accumulated += delta
+                    # Check for paragraph-level repetition every ~200 chars
+                    if len(accumulated) % 200 < len(delta):
+                        checked = _truncate_on_repetition(accumulated)
+                        if checked != accumulated:
+                            # Yield only the newly truncated portion then stop
+                            already_yielded = len(accumulated) - len(delta)
+                            tail = checked[already_yielded:]
+                            if tail:
+                                yield tail
+                            return
+                    yield delta
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
 
 
 # ---------------------------------------------------------------------------
-# Backend: local Ollama (all non-reasoning steps)
+# Backend: local Ollama (all pre-response steps)
 # ---------------------------------------------------------------------------
 
 def _ollama_base() -> str:
     return _ensure_protocol(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+
+
+def _strip_think(text: str) -> str:
+    """Print <think>...</think> blocks to stderr, then remove them from the returned text."""
+    import re
+    blocks = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    for block in blocks:
+        content = block.strip()
+        if content:
+            print(f"[think]\n{content}\n[/think]", file=sys.stderr)
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 async def _complete_local(
@@ -391,7 +437,7 @@ async def _complete_local(
     temperature: float = 0.7,
     max_tokens: int = 2048,
 ) -> str:
-    """Non-streaming call to the local apertus-tulu-xlam:8b model."""
+    """Non-streaming call to the local model."""
     full_messages = [{"role": "system", "content": system}] + messages
     payload = {
         "model": LOCAL_MODEL,
@@ -406,7 +452,7 @@ async def _complete_local(
         resp = await client.post(f"{_ollama_base()}/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data["message"]["content"]
+        return _strip_think(data["message"]["content"])
 
 
 async def _stream_complete_local(
@@ -415,7 +461,7 @@ async def _stream_complete_local(
     temperature: float = 0.8,
     max_tokens: int = 4096,
 ) -> AsyncIterator[str]:
-    """Streaming call to the local apertus-tulu-xlam:8b model; yields text deltas."""
+    """Streaming call to the local model; yields text deltas."""
     full_messages = [{"role": "system", "content": system}] + messages
     payload = {
         "model": LOCAL_MODEL,
@@ -516,21 +562,64 @@ async def run_pipeline(
 {tools_str}
 
 ## Task
-Decide: should a tool be called to answer the user's message, or should you respond directly?
+You are a routing step. Given the user's latest message, decide whether a tool must be \
+called or whether the question can be answered directly from knowledge.
 
-- If a tool should be called, output ONLY valid JSON with exactly these keys:
-  {{"tool": "<tool_name>", "args": {{<key>: <value>, ...}}}}
-- If no tool is needed, output ONLY the single word: DIRECT
+Output rules (follow exactly):
+- If a tool is needed: output ONLY valid JSON → {{"tool": "<tool_name>", "args": {{...}}}}
+- If no tool is needed: output ONLY the single word → DIRECT
 
-No explanation. No markdown fences. Output only the JSON object or the word DIRECT.
-"""
+Examples:
+  User: What is 2 + 2?
+  Output: DIRECT
+
+  User: Who won the 2024 US election?
+  Output: {{"tool": "web_search", "args": {{"query": "2024 US election winner"}}}}
+
+  User: Explain recursion.
+  Output: DIRECT
+
+No explanation. No prose. No markdown fences. Output only the JSON object or the word DIRECT.
+
+The user's latest message is:
+{last_user_msg}"""
     decision_raw = await _complete_local(
         decision_system,
-        user_messages,
+        [{"role": "user", "content": "Tool call or direct response?"}],
         temperature=0.1,
-        max_tokens=256,
+        max_tokens=1024,
     )
     decision = decision_raw.strip()
+
+    # Strip markdown fences
+    if decision.startswith("```"):
+        decision = "\n".join(
+            line for line in decision.splitlines()
+            if not line.strip().startswith("```")
+        ).strip()
+
+    # Normalise: if first word is "DIRECT" treat the whole response as DIRECT
+    first_word = decision.split()[0].upper().rstrip(".,;:") if decision else ""
+    if first_word == "DIRECT":
+        decision = "DIRECT"
+
+    # If the model buried JSON inside prose, extract the first {...} block
+    if decision != "DIRECT" and "{" in decision:
+        start = decision.index("{")
+        # Find the matching closing brace
+        depth, end = 0, -1
+        for i, ch in enumerate(decision[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end != -1:
+            decision = decision[start:end]
+
+    print(f"\n[pipeline] TOOL DECISION: {decision}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # Step 3: Execute tool (if decided)
@@ -538,16 +627,11 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
     tool_block = ""
     executed_tool = ""
     tool_result = ""
-
-    if decision.startswith("```"):
-        decision = "\n".join(
-            line for line in decision.splitlines()
-            if not line.strip().startswith("```")
-        ).strip()
+    fetched_urls: list[str] = []
 
     if decision.upper() != "DIRECT" and decision.startswith("{"):
         try:
-            call = json.loads(decision)
+            call = json.loads(decision.replace("\n", " ").replace("\r", " "))
             tool_name = call.get("tool", "")
             tool_args = call.get("args", {})
             if tool_name in TOOL_REGISTRY:
@@ -557,6 +641,7 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
                 )
                 executed_tool = tool_name
                 tool_result = result
+                print(f"[pipeline] Tool result:\n{result}", file=sys.stderr)
                 tool_block = (
                     f"\n\n## Tool results: {tool_name}({tool_args})\n"
                     f"```\n{result}\n```"
@@ -580,6 +665,7 @@ No explanation. No markdown fences. Output only the JSON object or the word DIRE
                     max_tokens=512,
                 )
                 tool_block += f"\n\n## Page summary: {url}\n{summary}"
+                fetched_urls.append(url)
 
     # ------------------------------------------------------------------
     # Step 3: Final response  →  PublicAI 70B
@@ -598,33 +684,82 @@ If web_search results are present above, apply these rules:
   undated or older than a few weeks relative to today.
 - If the search returned no relevant or recent results, say so rather than speculating.
 """
+    source_lines: list[str] = []
+    if executed_tool == "wikipedia_search" and tool_result:
+        for line in tool_result.splitlines():
+            if line.startswith("URL:"):
+                wiki_url = line[len("URL:"):].strip()
+                source_lines.append(f"- {wiki_url} (Wikipedia)")
+                break
+        if not source_lines:
+            source_lines.append("- *Wikipedia article (URL unavailable)*")
+    source_lines.extend(f"- {u}" for u in fetched_urls)
+
+    if source_lines:
+        sources_footer = "\n\n---\n**Sources:**\n" + "\n".join(source_lines)
+    elif executed_tool:
+        sources_footer = "\n\n---\n*Web search used; no individual pages were fetched.*"
+    else:
+        sources_footer = ""
+
     if stream:
-        return None, _stream_complete_remote(api_key, final_system, user_messages)
+        base_stream = _stream_complete_remote(api_key, final_system, user_messages)
+
+        async def _stream_with_sources():
+            async for delta in base_stream:
+                yield delta
+            if sources_footer:
+                yield sources_footer
+
+        return None, _stream_with_sources()
     else:
         text = await _complete_remote(api_key, final_system, user_messages, temperature=0.4, max_tokens=4096)
 
         # Format gate: ask local 8B if the response used markdown formatting.
         # If yes, send one corrective retry to the 70B.
-        gate_verdict = await _complete_local(
-            "You are a format checker. Does the following response use markdown formatting "
-            "(headers like ##, bullet lists starting with - or *, or bold/italic text with ** or *)? "
-            "Answer only YES or NO.",
-            [{"role": "user", "content": text}],
-            temperature=0.0,
-            max_tokens=4,
+        # Completeness gate: check if the response fully answers the question.
+        # If not, fetch more information and retry.
+        gate_system = (
+            "You are a quality checker. Given a user question and an assistant response, "
+            "decide whether the response fully and accurately answers the question.\n"
+            "If it does, output exactly: {\"complete\": true}\n"
+            "If it does not — e.g. the response is vague, says it lacks information, "
+            "or could clearly be improved by a quick lookup — output JSON naming the tool to call:\n"
+            "  {\"complete\": false, \"tool\": \"web_search\", \"args\": {\"query\": \"...\"}}\n"
+            "  or\n"
+            "  {\"complete\": false, \"tool\": \"wikipedia_search\", \"args\": {\"topic\": \"...\"}}\n"
+            "No explanation. No markdown fences. Output only valid JSON."
         )
-        if gate_verdict.strip().upper().startswith("YES"):
-            print("[pipeline] Format gate triggered — retrying final response without markdown", file=sys.stderr)
-            corrected_messages = user_messages + [
-                {"role": "assistant", "content": text},
-                {"role": "user", "content": (
-                    "Your previous response used markdown formatting (headers, bullets, or bold text). "
-                    "Please rewrite it as plain prose with no markdown. Keep it concise."
-                )},
-            ]
-            text = await _complete_remote(api_key, final_system, corrected_messages, temperature=0.3, max_tokens=4096)
+        gate_prompt = f"User question: {last_user_msg}\n\nAssistant response:\n{text}"
+        gate_raw = await _complete_local(
+            gate_system,
+            [{"role": "user", "content": gate_prompt}],
+            temperature=0.0,
+            max_tokens=128,
+        )
+        gate_raw = gate_raw.strip()
+        if gate_raw.startswith("```"):
+            gate_raw = "\n".join(
+                line for line in gate_raw.splitlines()
+                if not line.strip().startswith("```")
+            ).strip()
+        try:
+            gate = json.loads(gate_raw.replace("\n", " ").replace("\r", " "))
+        except (json.JSONDecodeError, ValueError):
+            gate = {"complete": True}
 
-        return text, None
+        if not gate.get("complete", True):
+            tool_name = gate.get("tool", "")
+            tool_args = gate.get("args", {})
+            if tool_name in TOOL_REGISTRY:
+                print(f"[pipeline] Completeness gate — fetching more info via {tool_name}({tool_args})", file=sys.stderr)
+                extra_result = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: TOOL_REGISTRY[tool_name](**tool_args)
+                )
+                extra_block = f"\n\n## Additional information: {tool_name}({tool_args})\n```\n{extra_result}\n```"
+                text = await _complete_remote(api_key, final_system + extra_block, user_messages, temperature=0.4, max_tokens=4096)
+
+        return text + sources_footer, None
 
 
 # ---------------------------------------------------------------------------

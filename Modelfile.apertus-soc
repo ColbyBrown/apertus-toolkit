@@ -1,0 +1,41 @@
+# Modelfile for the SOC-finetuned Apertus-8B model (Colby/apertus-8b-soc).
+#
+# Chat format: ChatML with arbitrary roles.
+# During training every turn used <|im_start|>{role}\n{content}<|im_end|> where
+# {role} is either "system" or a persona username (e.g. "jake_99", "maya_dev").
+# This template reproduces that format exactly — roles are not collapsed to
+# user/assistant. The generation suffix is a bare <|im_start|> so the model
+# selects the next speaker itself.
+#
+# Usage:
+#   ollama create apertus-soc -f Modelfile.apertus-soc
+#   ollama run apertus-soc
+#
+# To steer whose turn it is, append the desired username after <|im_start|>
+# in your prompt prefix, or set it via the API's "suffix" field.
+
+# FROM /tmp/gguf-apertus-soc/apertus-8b-soc-q4_k_m.gguf
+FROM C:\Users\colby\.cache\huggingface\hub\models--Colby--apertus-8b-soc-gguf\snapshots\29aee5e86a46bbba3e92199eb27b45d00ab6d151\apertus-8b-soc-q4_k_m.gguf
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ range .Messages }}<|im_start|>{{ .Role }}
+{{ .Content }}<|im_end|>
+{{ end }}<|im_start|>"""
+
+# Default system prompt — replace at runtime with full persona bios and
+# relationship/situation context, formatted as the training data expected:
+#
+#   Participants:
+#   - Name (@username, age N): background. Chatting style: style
+#   - ...
+#   Relationship: ...
+#   Situation: ...
+SYSTEM """This is a multi-participant chat. Each speaker is identified by their username.
+Respond as the most contextually appropriate participant, staying in character."""
+
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|im_start|>"
+PARAMETER num_ctx 4096
+PARAMETER temperature 0.85
+PARAMETER repeat_penalty 1.05
