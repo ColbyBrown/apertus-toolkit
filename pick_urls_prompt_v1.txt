@@ -1,0 +1,23 @@
+def pick_urls(query: str, search_results: str) -> list:
+    """
+    Given a user query and web search results (titles, URLs, snippets),
+    return a JSON array of up to 2 URLs worth fetching in full.
+    Return [] if the snippets already contain enough information to answer the query.
+    Prefer URLs from authoritative sources: official docs, major news outlets, Wikipedia.
+    """
+    ...
+
+pick_urls("What is the boiling point of water?", "Title: Boiling point - Wikipedia\nURL: https://en.wikipedia.org/wiki/Boiling_point\nSnippet: The boiling point of water at standard atmospheric pressure is 100 degrees Celsius (212 F).")
+# Returns: []
+
+pick_urls("How do I install numpy?", "Title: NumPy installation guide\nURL: https://numpy.org/install/\nSnippet: NumPy can be installed with pip or conda.\nTitle: Stack Overflow - installing numpy\nURL: https://stackoverflow.com/questions/10729210\nSnippet: Run pip install numpy in your terminal.")
+# Returns: []
+
+pick_urls("What are the new features in Python 3.13?", "Title: Python 3.13 release notes\nURL: https://docs.python.org/3/whatsnew/3.13.html\nSnippet: Python 3.13 includes improvements to the interpreter and standard library.\nTitle: Real Python - Python 3.13 overview\nURL: https://realpython.com/python313/\nSnippet: A summary of what is new in Python 3.13.")
+# Returns: ["https://docs.python.org/3/whatsnew/3.13.html"]
+
+pick_urls("Who won the 2024 US presidential election?", "Title: 2024 US Election Results - AP News\nURL: https://apnews.com/election-2024\nSnippet: Donald Trump won the 2024 US presidential election, defeating Kamala Harris.\nTitle: CNN Election Results\nURL: https://cnn.com/election/2024\nSnippet: Trump wins 2024 race.")
+# Returns: []
+
+pick_urls("How does Python asyncio work internally?", "Title: asyncio event loop docs\nURL: https://docs.python.org/3/library/asyncio-eventloop.html\nSnippet: The event loop is the core of every asyncio application.\nTitle: Real Python - async IO in Python\nURL: https://realpython.com/async-io-python/\nSnippet: A comprehensive guide to asyncio internals and patterns.")
+# Returns: ["https://docs.python.org/3/library/asyncio-eventloop.html", "https://realpython.com/async-io-python/"]

@@ -28,6 +28,7 @@ from typing import AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
+from transformers import pipeline as _hf_pipeline
 from fastapi.responses import StreamingResponse, JSONResponse
 from dotenv import load_dotenv
 import uvicorn
@@ -104,9 +105,169 @@ _TA_PROMPT_CACHE: str | None = None
 def _load_ta_prompt() -> str:
     global _TA_PROMPT_CACHE
     if _TA_PROMPT_CACHE is None:
-        with open(_TA_PROMPT_PATH, "r") as f:
+        with open(_TA_PROMPT_PATH, "r", encoding="utf-8") as f:
             _TA_PROMPT_CACHE = f.read()
     return _TA_PROMPT_CACHE
+
+
+_CG_PROMPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "completeness_prompt_v1.txt")
+_CG_PROMPT_CACHE: str | None = None
+
+def _load_cg_prompt() -> str:
+    global _CG_PROMPT_CACHE
+    if _CG_PROMPT_CACHE is None:
+        with open(_CG_PROMPT_PATH, "r", encoding="utf-8") as f:
+            _CG_PROMPT_CACHE = f.read()
+    return _CG_PROMPT_CACHE
+
+
+# ---------------------------------------------------------------------------
+# MNLI zero-shot classifier — tool routing
+# ---------------------------------------------------------------------------
+print("[init] Loading MNLI classifier...", file=sys.stderr)
+_nli_pipe = _hf_pipeline(
+    "zero-shot-classification",
+    model="cross-encoder/nli-deberta-v3-small",
+    device=-1,  # CPU
+)
+print("[init] MNLI classifier ready.", file=sys.stderr)
+
+# (label, tool_name, threshold) — higher threshold = more conservative
+_ROUTING_LABELS: list[tuple[str, str, float]] = [
+    ("current events, live data, recent news, or time-sensitive information", "web_search",       0.5),
+    ("encyclopedic or historical facts, biography, or well-known concepts",   "wikipedia_search",  0.5),
+    ("programming, coding, software development, or debugging",               "starcoder",         0.5),
+    ("complex reasoning, philosophical or ethical analysis, or strategic tradeoffs", "think",      0.5),
+]
+
+
+def _mnli_decision(last_user_msg: str) -> str:
+    """
+    Zero-shot NLI routing. Returns a JSON tool-call string or "DIRECT".
+    Synchronous — safe to call from run_in_executor.
+    """
+    if not last_user_msg.strip():
+        return "DIRECT"
+    _MAX_MSG = 200
+    msg = last_user_msg if len(last_user_msg) <= _MAX_MSG else last_user_msg[:_MAX_MSG] + "..."
+    candidate_labels = [label for label, _, _ in _ROUTING_LABELS]
+    result = _nli_pipe(msg, candidate_labels=candidate_labels, multi_label=False)
+
+    top_label = result["labels"][0]
+    top_score = result["scores"][0]
+
+    for label, tool_name, threshold in _ROUTING_LABELS:
+        if label == top_label and top_score >= threshold:
+            if tool_name == "web_search":
+                args: dict = {"query": msg}
+            elif tool_name == "wikipedia_search":
+                args = {"topic": msg}
+            elif tool_name == "starcoder":
+                args = {"query": msg, "mode": "chat"}
+            else:  # think
+                args = {"query": msg}
+            print(f"[pipeline] MNLI → {tool_name} (score={top_score:.2f})", file=sys.stderr)
+            return json.dumps({"tool": tool_name, "args": args})
+
+    print(f"[pipeline] MNLI → DIRECT (top={top_label!r}, score={top_score:.2f})", file=sys.stderr)
+    return "DIRECT"
+
+
+def _nli_pick_urls(query: str, search_results: str, max_urls: int = 2, threshold: float = 0.50) -> list[str]:
+    """
+    Score each search result's (title + snippet) against the query using NLI entailment.
+    Returns up to max_urls URLs whose snippets score above the relevance threshold,
+    sorted by score descending. Synchronous — safe to call from run_in_executor.
+    """
+    candidates: list[tuple[str, str]] = []  # (url, scoring_text)
+    current: dict = {}
+    for line in search_results.splitlines():
+        if line.startswith("Title:"):
+            current["title"] = line[6:].strip()
+        elif line.startswith("URL:"):
+            current["url"] = line[4:].strip()
+        elif line.startswith("Snippet:"):
+            current["snippet"] = line[8:].strip()
+        elif not line.strip() and "url" in current and "snippet" in current:
+            text = f"{current.get('title', '')}. {current['snippet']}"[:400]
+            candidates.append((current["url"], text))
+            current = {}
+    if "url" in current and "snippet" in current:  # flush last block
+        text = f"{current.get('title', '')}. {current['snippet']}"[:400]
+        candidates.append((current["url"], text))
+
+    if not candidates:
+        return []
+
+    scored: list[tuple[float, str]] = []
+    for url, text in candidates:
+        try:
+            result = _nli_pipe(
+                text,
+                candidate_labels=[query],
+                hypothesis_template="This page contains information relevant to: {}",
+            )
+            score = result["scores"][0]
+            print(f"[pick_urls] {score:.2f} {url}", file=sys.stderr)
+            if score >= threshold:
+                scored.append((score, url))
+        except Exception as e:
+            print(f"[pick_urls] NLI error for {url}: {e}", file=sys.stderr)
+
+    scored.sort(reverse=True)
+    return [url for _, url in scored[:max_urls]]
+
+
+def _starcoder_check_complete(question: str, response: str) -> dict:
+    """
+    Use StarCoder + completeness_prompt_v1.txt to check whether the 70B response
+    fully answered the question. Returns a dict with key 'complete' (bool) and
+    optionally 'tool' and 'args' for a follow-up lookup.
+    """
+    ollama_base = _ensure_protocol(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+    cg_prompt = _load_cg_prompt()
+    _MAX_Q, _MAX_R = 200, 500
+    rq = question if len(question) <= _MAX_Q else question[:_MAX_Q] + "..."
+    rr = response if len(response) <= _MAX_R else response[:_MAX_R] + "..."
+    call_line = f"check_complete({json.dumps(rq)}, {json.dumps(rr)})\n# Returns:"
+    prompt = cg_prompt.rstrip() + "\n\n" + call_line
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                f"{ollama_base}/api/generate",
+                json={
+                    "model": "starcoder:latest",
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "num_predict": 128,
+                        "temperature": 0.0,
+                        "stop": ["\ncheck_complete(", "\n\n"],
+                    },
+                },
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "").strip().replace("\n", " ").replace("\r", " ")
+            # Extract first {...} block — StarCoder may append trailing text
+            if "{" in raw:
+                start = raw.index("{")
+                depth, end = 0, -1
+                for i, ch in enumerate(raw[start:], start):
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if end != -1:
+                    raw = raw[start:end]
+            result = json.loads(raw)
+            if isinstance(result, dict):
+                return result
+    except Exception as e:
+        print(f"[pipeline] StarCoder check_complete error: {e} — assuming complete", file=sys.stderr)
+    return {"complete": True}
 
 
 def _tool_starcoder(
@@ -208,10 +369,150 @@ async def _fetch_url_text(url: str, max_chars: int = 8000) -> str:
         return f"[fetch error: {e}]"
 
 
+THINK_TURNS = 2  # number of 8B turns; 70B turns = THINK_TURNS - 1
+
+
+def _sync_call_70b(system: str, messages: list[dict], max_tokens: int = 512) -> str:
+    """Synchronous 70B call via PublicAI. For use inside thread-pool-executed tools."""
+    api_key = os.environ.get("PUBLICAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("PUBLICAI_API_KEY not set")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "ApertusProxy/1.0",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": UPSTREAM_MODEL,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(f"{PUBLICAI_BASE}/chat/completions", headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def _sync_call_8b(system: str, messages: list[dict], max_tokens: int = 256) -> str:
+    """Synchronous local 8B call via Ollama. For use inside thread-pool-executed tools."""
+    ollama_base = _ensure_protocol(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+    payload = {
+        "model": LOCAL_MODEL,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "stream": False,
+        "options": {"temperature": 0.8, "top_p": 0.9, "num_predict": max_tokens},
+    }
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(f"{ollama_base}/api/chat", json=payload)
+        resp.raise_for_status()
+        return resp.json()["message"]["content"].strip()
+
+
+def _tool_think(query: str, conversation: str = "", base_system: str = "") -> dict:
+    """
+    Collaborative reasoning via structured 8B ↔ 70B dialogue.
+
+    1. Summarize the user-assistant conversation (70B)
+    2. Run THINK_TURNS exchanges between 8B and 70B
+    3. Summarize the discussion transcript (70B)
+    4. Return the summary as context for the 8B's final response
+
+    Synchronous — runs in TOOL_REGISTRY's executor pattern.
+    """
+    try:
+        # ── Step 1: Summarize the dialogue ────────────────────────────────
+        if conversation:
+            dialogue_summary = _sync_call_70b(
+                "Summarize the following conversation in 1-3 sentences, focusing on "
+                "what the user is trying to understand or decide.",
+                [{"role": "user", "content": conversation}],
+                max_tokens=128,
+            )
+        else:
+            dialogue_summary = query
+        print(f"[think] Dialogue summary: {dialogue_summary}", file=sys.stderr)
+
+        # ── Step 1b: Pre-fetch grounding context for the 8B only ─────────
+        grounding_block = ""
+        g_tool = ""
+        g_result = ""
+        try:
+            g_decision = _mnli_decision(dialogue_summary)
+            if g_decision != "DIRECT" and g_decision.startswith("{"):
+                g_call = json.loads(g_decision.replace("\n", " ").replace("\r", " "))
+                _gt = g_call.get("tool", "")
+                g_args = g_call.get("args", {})
+                if _gt in ("web_search", "wikipedia_search"):
+                    g_tool = _gt
+                    g_result = TOOL_REGISTRY[g_tool](**g_args)
+                    grounding_block = (
+                        f"\n\nBackground information (use this to ground your reasoning):\n"
+                        f"```\n{g_result}\n```"
+                    )
+                    print(f"[think] Pre-fetched {g_tool} for 8B grounding", file=sys.stderr)
+        except Exception as e:
+            print(f"[think] Grounding fetch error: {e}", file=sys.stderr)
+
+        # ── Step 2: Discussion loop ───────────────────────────────────────
+        _persona = base_system if base_system else _charter()
+        system_8b = (
+            f"{_persona}\n\n"
+            f"You are now in an internal reasoning dialogue with a larger version of yourself "
+            f"(Apertus 70B) before composing your final response to the user. "
+            f"Respond in exactly 2 sentences. Stay strictly within your actual capabilities — "
+            f"do not suggest or offer actions you cannot perform.\n"
+            f"Discussion topic: {dialogue_summary}"
+            f"{grounding_block}"
+        )
+        system_70b = (
+            f"You are engaged in a collaborative reasoning discussion. "
+            f"Respond to the other participant's points in exactly 2 sentences.\n"
+            f"Topic: {dialogue_summary}"
+        )
+
+        history_8b: list[dict] = [{"role": "user", "content": "Begin the discussion."}]
+        history_70b: list[dict] = []
+        turns: list[tuple[str, str]] = []  # (speaker, text)
+
+        for i in range(THINK_TURNS):
+            # 8B turn
+            text_8b = _sync_call_8b(system_8b, history_8b, max_tokens=80)
+            print(f"[think] 8B: {text_8b}", file=sys.stderr)
+            turns.append(("8B", text_8b))
+            history_8b.append({"role": "assistant", "content": text_8b})
+
+            if i < THINK_TURNS - 1:
+                # 70B turn (not after the last 8B turn)
+                history_70b.append({"role": "user", "content": text_8b})
+                text_70b = _sync_call_70b(system_70b, history_70b, max_tokens=120)
+                print(f"[think] 70B: {text_70b}", file=sys.stderr)
+                turns.append(("70B", text_70b))
+                history_70b.append({"role": "assistant", "content": text_70b})
+                history_8b.append({"role": "user", "content": text_70b})
+
+        # ── Step 3: Summarize the discussion ─────────────────────────────
+        transcript = "\n".join(f"{speaker}: {text}" for speaker, text in turns)
+        summary = _sync_call_70b(
+            "Summarize the key insights and conclusions from this discussion in 2-4 sentences.",
+            [{"role": "user", "content": transcript}],
+            max_tokens=256,
+        )
+        print(f"[think] Summary: {summary}", file=sys.stderr)
+        return {"summary": summary, "grounding_tool": g_tool, "grounding_result": g_result}
+
+    except Exception as e:
+        print(f"[think] Error: {e}", file=sys.stderr)
+        return {"summary": f"[think error] {e}", "grounding_tool": "", "grounding_result": ""}
+
+
 TOOL_REGISTRY = {
     "web_search": _tool_web_search,
     "wikipedia_search": _tool_wikipedia_search,
     "starcoder": _tool_starcoder,
+    "think": _tool_think,
 }
 
 TOOL_DESCRIPTIONS = {
@@ -249,6 +550,16 @@ TOOL_DESCRIPTIONS = {
             "max_tokens": "integer (optional, default 512) — maximum tokens to generate",
         },
     },
+    "think": {
+        "description": (
+            "Invoke an extended reasoning pass on a complex, open-ended, or multi-step question. "
+            "Use for philosophical, ethical, strategic, or analytical questions where deliberation "
+            "clearly adds value. Do not use for factual lookups, coding tasks, or simple questions."
+        ),
+        "parameters": {
+            "query": "string — the question or topic to reason about",
+        },
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -256,34 +567,39 @@ TOOL_DESCRIPTIONS = {
 # ---------------------------------------------------------------------------
 
 PUBLICAI_BASE = "https://api.publicai.co/v1"
-UPSTREAM_MODEL = "swiss-ai/apertus-70b-instruct"   # used for final response 
-LOCAL_MODEL = "qwen3:8b"                           # used for reasoning
-OLLAMA_MODEL_NAME = "apertus-hybrid"             # name advertised to Ollama clients
+UPSTREAM_MODEL = "swiss-ai/apertus-70b-instruct"   # used by think tool + URL summarisation
+LOCAL_MODEL = "MichelRosselli/apertus"          # local model for final responses
+OLLAMA_MODEL_NAME = "apertus-hybrid"               # name advertised to Ollama clients
 
-CHARTER = """\
+PERSONA = """\
 You are Apertus, an open, capable, and honest AI assistant developed as part of the \
 Swiss AI initiative. Your core commitments:
 
 - Truthfulness: be accurate; acknowledge uncertainty rather than confabulating
-- Helpfulness: focus on what the user actually needs
-- Format: plain prose only — no markdown headers, bullet lists, or bold/italic text \
-unless the user explicitly asks for formatted output or a list. Write in flowing sentences.
-- Length: answer in as few words as the question requires. Do not pad responses with \
-context the user did not ask for. If a one-sentence answer suffices, use one sentence.
-- Tool use: use the right tool for the job —
-    web_search for recent/time-sensitive information,
-    wikipedia_search for encyclopedic background,
-    starcoder for coding tasks (generation, debugging, explanation, completion)
-- Autonomy: respect the user's goals and do not over-explain or moralise
-
-Example of incorrect format: "Here are the key points:\\n- Point one\\n- Point two"
-Example of correct format: "Point one. Point two."
+- Helpfulness: focus on what the user actually needs\
 """
+
+FORMAT_RULES = """\
+- Brevity (highest priority): be as short as possible. One sentence is better than two. \
+Never restate the question. Never explain what you are about to do — just do it. \
+Never add caveats, disclaimers, or context the user did not ask for.
+- Format: plain prose only. No markdown headers, bullet lists, or bold/italic text \
+unless the user explicitly requests them. No preamble ("Great question!", "Sure!", \
+"Of course!"). No closing summary or sign-off.
+
+Bad: "That's a great question! The boiling point of water is 100°C at standard atmospheric pressure. I hope that helps!"
+Good: "100°C at standard pressure."
+
+Bad: "Here are the key points: first, X. Second, Y. In summary, X and Y matter."
+Good: "X. Y."\
+"""
+
+CHARTER = PERSONA + "\n\n" + FORMAT_RULES
 
 
 def _charter() -> str:
     now = datetime.now(timezone.utc).strftime("%A, %d %B %Y %H:%M UTC")
-    return f"Current date and time: {now}\n\n" + CHARTER
+    return f"Current date and time: {now}\n\n{CHARTER}"
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +750,8 @@ def _strip_think(text: str) -> str:
 async def _complete_local(
     system: str,
     messages: list[dict],
-    temperature: float = 0.7,
+    temperature: float = 0.8,
+    top_p: float = 0.9,
     max_tokens: int = 2048,
 ) -> str:
     """Non-streaming call to the local model."""
@@ -445,6 +762,7 @@ async def _complete_local(
         "stream": False,
         "options": {
             "temperature": temperature,
+            "top_p": top_p,
             "num_predict": max_tokens,
         },
     }
@@ -459,6 +777,7 @@ async def _stream_complete_local(
     system: str,
     messages: list[dict],
     temperature: float = 0.8,
+    top_p: float = 0.9,
     max_tokens: int = 4096,
 ) -> AsyncIterator[str]:
     """Streaming call to the local model; yields text deltas."""
@@ -469,6 +788,7 @@ async def _stream_complete_local(
         "stream": True,
         "options": {
             "temperature": temperature,
+            "top_p": top_p,
             "num_predict": max_tokens,
         },
     }
@@ -495,33 +815,9 @@ async def _stream_complete_local(
 # ---------------------------------------------------------------------------
 
 async def _decide_fetch_urls(search_results: str, query: str) -> list[str]:
-    system = (
-        "You are a research assistant. Given web search results and a user query, "
-        "decide which URLs (if any) are worth fetching in full for a more detailed answer. "
-        "Output ONLY a JSON array of up to 2 URL strings (e.g. [\"https://...\", \"https://...\"]). "
-        "If the snippets are sufficient, output an empty array: []. "
-        "No explanation, no markdown fences — only the JSON array."
+    return await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _nli_pick_urls(query, search_results)
     )
-    prompt = f"Query: {query}\n\nSearch results:\n{search_results}"
-    raw = await _complete_local(
-        system,
-        [{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=128,
-    )
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(
-            line for line in raw.splitlines()
-            if not line.strip().startswith("```")
-        ).strip()
-    try:
-        urls = json.loads(raw)
-        if isinstance(urls, list):
-            return [u for u in urls if isinstance(u, str)]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return []
 
 
 # ---------------------------------------------------------------------------
@@ -541,53 +837,26 @@ async def run_pipeline(
     api_key: str,
     messages: list[dict],
     stream: bool = False,
-) -> tuple[str | None, AsyncIterator[str] | None]:
+    think_enabled: bool = True,
+) -> tuple[str | None, AsyncIterator | None, str]:
     """
     Run the full reasoning → decision → tool → respond pipeline.
 
     Returns (full_text, None) if stream=False,
             (None, async_iterator) if stream=True.
     """
+    client_system = next(
+        (m["content"] for m in messages if m.get("role") == "system"), ""
+    )
     user_messages = [m for m in messages if m.get("role") != "system"]
     last_user_msg = next(
         (m["content"] for m in reversed(user_messages) if m["role"] == "user"), ""
     )
-    tools_str = json.dumps(TOOL_DESCRIPTIONS, indent=2)
-
     # ------------------------------------------------------------------
-    # Step 1: Tool call decision  →  local 8B (native reasoning)
+    # Step 1: Tool call decision  →  StarCoder (in-context learning)
     # ------------------------------------------------------------------
-    decision_system = f"""{_charter()}
-## Your tools
-{tools_str}
-
-## Task
-You are a routing step. Given the user's latest message, decide whether a tool must be \
-called or whether the question can be answered directly from knowledge.
-
-Output rules (follow exactly):
-- If a tool is needed: output ONLY valid JSON → {{"tool": "<tool_name>", "args": {{...}}}}
-- If no tool is needed: output ONLY the single word → DIRECT
-
-Examples:
-  User: What is 2 + 2?
-  Output: DIRECT
-
-  User: Who won the 2024 US election?
-  Output: {{"tool": "web_search", "args": {{"query": "2024 US election winner"}}}}
-
-  User: Explain recursion.
-  Output: DIRECT
-
-No explanation. No prose. No markdown fences. Output only the JSON object or the word DIRECT.
-
-The user's latest message is:
-{last_user_msg}"""
-    decision_raw = await _complete_local(
-        decision_system,
-        [{"role": "user", "content": "Tool call or direct response?"}],
-        temperature=0.1,
-        max_tokens=1024,
+    decision_raw = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _mnli_decision(last_user_msg)
     )
     decision = decision_raw.strip()
 
@@ -622,59 +891,103 @@ The user's latest message is:
     print(f"\n[pipeline] TOOL DECISION: {decision}", file=sys.stderr)
 
     # ------------------------------------------------------------------
-    # Step 3: Execute tool (if decided)
+    # Step 3: Parse pending tool (execution deferred to step 4)
     # ------------------------------------------------------------------
-    tool_block = ""
-    executed_tool = ""
-    tool_result = ""
-    fetched_urls: list[str] = []
+    pending_tool_name = ""
+    pending_tool_args: dict = {}
 
     if decision.upper() != "DIRECT" and decision.startswith("{"):
         try:
             call = json.loads(decision.replace("\n", " ").replace("\r", " "))
-            tool_name = call.get("tool", "")
-            tool_args = call.get("args", {})
-            if tool_name in TOOL_REGISTRY:
-                print(f"[pipeline] Calling tool: {tool_name}({tool_args})", file=sys.stderr)
-                result = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: TOOL_REGISTRY[tool_name](**tool_args)
-                )
-                executed_tool = tool_name
-                tool_result = result
-                print(f"[pipeline] Tool result:\n{result}", file=sys.stderr)
-                tool_block = (
-                    f"\n\n## Tool results: {tool_name}({tool_args})\n"
-                    f"```\n{result}\n```"
-                )
+            _ptn = call.get("tool", "")
+            if _ptn in TOOL_REGISTRY:
+                pending_tool_name = _ptn
+                pending_tool_args = call.get("args", {})
+                if pending_tool_name == "think" and not think_enabled:
+                    print("[pipeline] think disabled by client — treating as DIRECT", file=sys.stderr)
+                    pending_tool_name = ""
+                    pending_tool_args = {}
             else:
-                print(f"[pipeline] Unknown tool requested: {tool_name}", file=sys.stderr)
+                print(f"[pipeline] Unknown tool requested: {_ptn}", file=sys.stderr)
         except (json.JSONDecodeError, TypeError) as e:
             print(f"[pipeline] Decision parse error: {e} — treating as DIRECT", file=sys.stderr)
 
-    # ── Step 3b: fetch URLs if web_search was used  →  local 8B ─────────
-    if executed_tool == "web_search" and tool_result:
-        fetch_urls = await _decide_fetch_urls(tool_result, last_user_msg)
-        for url in fetch_urls:
-            page_text = await _fetch_url_text(url)
-            if not page_text.startswith("[fetch error"):
-                summary = await _complete_local(
-                    f"Summarise the following web page, focusing on what is relevant "
-                    f"to the query: {last_user_msg!r}\nBe concise (200–300 words).",
-                    [{"role": "user", "content": page_text}],
-                    temperature=0.3,
-                    max_tokens=512,
-                )
-                tool_block += f"\n\n## Page summary: {url}\n{summary}"
-                fetched_urls.append(url)
+    # ------------------------------------------------------------------
+    # Helper: execute the pending tool and build context strings
+    # ------------------------------------------------------------------
+    async def _execute_tool_and_build_context():
+        """Run the pending tool (if any) and return (executed_tool, tool_result,
+        tool_block, fetched_urls, sources_footer, final_system)."""
+        executed_tool = ""
+        tool_result = ""
+        tool_block = ""
+        fetched_urls: list[str] = []
+        grounding_tool = ""
+        grounding_result = ""
 
-    # ------------------------------------------------------------------
-    # Step 3: Final response  →  PublicAI 70B
-    # ------------------------------------------------------------------
-    tool_section = f"\n\n## Tool results\n{tool_block}" if tool_block else ""
-    final_system = f"""{_charter()}{tool_section}
+        if pending_tool_name:
+            t_args = {**pending_tool_args}
+            if pending_tool_name == "think":
+                t_args["conversation"] = _format_conversation(user_messages)
+                t_args["base_system"] = client_system if client_system else _charter()
+            print(f"[pipeline] Calling tool: {pending_tool_name}({t_args})", file=sys.stderr)
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: TOOL_REGISTRY[pending_tool_name](**t_args)
+            )
+            executed_tool = pending_tool_name
+
+            # think returns a dict; extract summary and grounding metadata
+            if pending_tool_name == "think" and isinstance(result, dict):
+                grounding_tool = result.get("grounding_tool", "")
+                grounding_result = result.get("grounding_result", "")
+                tool_result = result.get("summary", "")
+            else:
+                grounding_tool = ""
+                grounding_result = ""
+                tool_result = result
+
+            print(f"[pipeline] Tool result:\n{tool_result}", file=sys.stderr)
+            tool_block = (
+                f"\n\n## Tool results: {pending_tool_name}({t_args})\n"
+                f"```\n{tool_result}\n```"
+            )
+
+        # URL fetch for web_search
+        if executed_tool == "web_search" and tool_result:
+            fetch_urls = await _decide_fetch_urls(tool_result, last_user_msg)
+            for url in fetch_urls:
+                try:
+                    page_text = await _fetch_url_text(url)
+                    if not page_text.startswith("[fetch error"):
+                        summary = await _complete_remote(
+                            api_key,
+                            f"Summarise the following web page, focusing on what is relevant "
+                            f"to the query: {last_user_msg!r}\nBe concise (200–300 words).",
+                            [{"role": "user", "content": page_text}],
+                            temperature=0.3,
+                            max_tokens=512,
+                        )
+                        tool_block += f"\n\n## Page summary: {url}\n{summary}"
+                        fetched_urls.append(url)
+                except Exception as e:
+                    print(f"[pipeline] Page summarisation error for {url}: {e}", file=sys.stderr)
+
+        # Build final_system
+        tool_section = tool_block if tool_block else ""
+        base_system = client_system if client_system else _charter()
+        think_instruction = (
+            "\n\nDo not reference the reasoning process, the discussion, or any internal"
+            " analysis in your reply. Answer naturally and directly as if the context"
+            " above is simply what you know."
+            if executed_tool == "think" else ""
+        )
+        final_system = f"""{base_system}{tool_section}{think_instruction}
 
 ## Web search guidance
 If web_search results are present above, apply these rules:
+- When your response draws on a fetched page summary (sections labelled "Page summary: <url>"),
+  include that URL inline in your reply so the user can follow up. For example: "According to
+  [example.com/article](https://example.com/article), …"
 - Check whether snippets or fetched page summaries mention a publication or event date.
   Compare it against today's date shown at the top of this prompt.
 - For time-sensitive queries (recent events, current status, latest news): if you cannot
@@ -684,82 +997,98 @@ If web_search results are present above, apply these rules:
   undated or older than a few weeks relative to today.
 - If the search returned no relevant or recent results, say so rather than speculating.
 """
-    source_lines: list[str] = []
-    if executed_tool == "wikipedia_search" and tool_result:
-        for line in tool_result.splitlines():
-            if line.startswith("URL:"):
-                wiki_url = line[len("URL:"):].strip()
-                source_lines.append(f"- {wiki_url} (Wikipedia)")
-                break
-        if not source_lines:
-            source_lines.append("- *Wikipedia article (URL unavailable)*")
-    source_lines.extend(f"- {u}" for u in fetched_urls)
 
-    if source_lines:
-        sources_footer = "\n\n---\n**Sources:**\n" + "\n".join(source_lines)
-    elif executed_tool:
-        sources_footer = "\n\n---\n*Web search used; no individual pages were fetched.*"
-    else:
-        sources_footer = ""
+        # Build sources footer — only list pages actually fetched, not all search results
+        source_lines: list[str] = []
 
+        if executed_tool == "web_search":
+            # Only show URLs that were fetched in full; snippet-only search gets a note
+            source_lines = [f"- {u}" for u in fetched_urls]
+        elif executed_tool == "wikipedia_search" and tool_result:
+            for line in tool_result.splitlines():
+                if line.startswith("URL:"):
+                    source_lines.append(f"- {line[len('URL:'):].strip()} (Wikipedia)")
+                    break
+            if not source_lines:
+                source_lines.append("- *Wikipedia article (URL unavailable)*")
+
+        # Sources from think's grounding fetch
+        if grounding_tool == "wikipedia_search" and grounding_result:
+            for line in grounding_result.splitlines():
+                if line.startswith("URL:"):
+                    source_lines.append(f"- {line[len('URL:'):].strip()} (Wikipedia)")
+                    break
+            if not any("Wikipedia" in s for s in source_lines):
+                source_lines.append("- *Wikipedia article (URL unavailable)*")
+        # grounding web_search: no individual pages fetched, note it if nothing else listed
+        grounding_search_used = grounding_tool == "web_search" and grounding_result
+
+        if source_lines:
+            sources_footer = "\n\n---\n**Sources:**\n" + "\n".join(source_lines)
+        elif executed_tool == "web_search" or grounding_search_used:
+            sources_footer = "\n\n---\n*Web search used; no individual pages were fetched.*"
+        else:
+            sources_footer = ""
+
+        think_summary = tool_result if executed_tool == "think" else ""
+        return executed_tool, tool_result, tool_block, fetched_urls, sources_footer, final_system, think_summary
+
+    # ------------------------------------------------------------------
+    # Step 4: Streaming path — status message first, tool runs inside generator
+    # ------------------------------------------------------------------
     if stream:
-        base_stream = _stream_complete_remote(api_key, final_system, user_messages)
-
         async def _stream_with_sources():
-            async for delta in base_stream:
+            # Yield status message BEFORE the (potentially slow) tool runs.
+            # Use thinking field (not content) so clients don't store it in history.
+            if pending_tool_name == "think":
+                yield {"thinking": "Entering deep reasoning mode..."}
+            elif pending_tool_name == "starcoder":
+                yield {"thinking": "Entering code assistant mode..."}
+
+            # Now execute tool and build context
+            _, _, _, _, sources_footer, final_system, think_summary = (
+                await _execute_tool_and_build_context()
+            )
+
+            # Emit thinking content before response content
+            if think_summary:
+                yield {"thinking": think_summary}
+
+            async for delta in _stream_complete_local(final_system, user_messages):
                 yield delta
             if sources_footer:
-                yield sources_footer
+                yield {"thinking": sources_footer}
 
-        return None, _stream_with_sources()
-    else:
-        text = await _complete_remote(api_key, final_system, user_messages, temperature=0.4, max_tokens=4096)
+        return None, _stream_with_sources(), ""
 
-        # Format gate: ask local 8B if the response used markdown formatting.
-        # If yes, send one corrective retry to the 70B.
-        # Completeness gate: check if the response fully answers the question.
-        # If not, fetch more information and retry.
-        gate_system = (
-            "You are a quality checker. Given a user question and an assistant response, "
-            "decide whether the response fully and accurately answers the question.\n"
-            "If it does, output exactly: {\"complete\": true}\n"
-            "If it does not — e.g. the response is vague, says it lacks information, "
-            "or could clearly be improved by a quick lookup — output JSON naming the tool to call:\n"
-            "  {\"complete\": false, \"tool\": \"web_search\", \"args\": {\"query\": \"...\"}}\n"
-            "  or\n"
-            "  {\"complete\": false, \"tool\": \"wikipedia_search\", \"args\": {\"topic\": \"...\"}}\n"
-            "No explanation. No markdown fences. Output only valid JSON."
-        )
-        gate_prompt = f"User question: {last_user_msg}\n\nAssistant response:\n{text}"
-        gate_raw = await _complete_local(
-            gate_system,
-            [{"role": "user", "content": gate_prompt}],
-            temperature=0.0,
-            max_tokens=128,
-        )
-        gate_raw = gate_raw.strip()
-        if gate_raw.startswith("```"):
-            gate_raw = "\n".join(
-                line for line in gate_raw.splitlines()
-                if not line.strip().startswith("```")
-            ).strip()
-        try:
-            gate = json.loads(gate_raw.replace("\n", " ").replace("\r", " "))
-        except (json.JSONDecodeError, ValueError):
-            gate = {"complete": True}
+    # ------------------------------------------------------------------
+    # Step 4: Non-streaming path
+    # ------------------------------------------------------------------
+    executed_tool, tool_result, tool_block, _, sources_footer, final_system, think_summary = (
+        await _execute_tool_and_build_context()
+    )
 
-        if not gate.get("complete", True):
-            tool_name = gate.get("tool", "")
-            tool_args = gate.get("args", {})
-            if tool_name in TOOL_REGISTRY:
-                print(f"[pipeline] Completeness gate — fetching more info via {tool_name}({tool_args})", file=sys.stderr)
-                extra_result = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: TOOL_REGISTRY[tool_name](**tool_args)
-                )
-                extra_block = f"\n\n## Additional information: {tool_name}({tool_args})\n```\n{extra_result}\n```"
-                text = await _complete_remote(api_key, final_system + extra_block, user_messages, temperature=0.4, max_tokens=4096)
+    text = await _complete_local(final_system, user_messages, temperature=0.7, max_tokens=4096)
 
-        return text + sources_footer, None
+    # Completeness gate: use StarCoder to check if the response fully answers
+    # the question. If not, fire a follow-up tool call and retry with local Apertus.
+    gate = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: _starcoder_check_complete(last_user_msg, text)
+    )
+
+    if not gate.get("complete", True):
+        gate_tool_name = gate.get("tool", "")
+        gate_tool_args = gate.get("args", {})
+        if gate_tool_name in TOOL_REGISTRY:
+            print(f"[pipeline] Completeness gate — fetching more info via {gate_tool_name}({gate_tool_args})", file=sys.stderr)
+            extra_result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: TOOL_REGISTRY[gate_tool_name](**gate_tool_args)
+            )
+            extra_block = f"\n\n## Additional information: {gate_tool_name}({gate_tool_args})\n```\n{extra_result}\n```"
+            text = await _complete_local(final_system + extra_block, user_messages, temperature=0.7, max_tokens=4096)
+
+    thinking_out = "\n\n".join(filter(None, [think_summary, sources_footer]))
+    return text, None, thinking_out
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +1139,7 @@ async def chat(request: Request):
     api_key = _get_api_key()
     messages: list[dict] = body.get("messages", [])
     do_stream: bool = body.get("stream", True)
+    think_flag: bool = body.get("think", True)
 
     if not messages:
         raise HTTPException(status_code=400, detail="messages required")
@@ -817,16 +1147,24 @@ async def chat(request: Request):
     created_at = _now_iso()
 
     if do_stream:
-        _, stream_iter = await run_pipeline(api_key, messages, stream=True)
+        _, stream_iter, _ = await run_pipeline(api_key, messages, stream=True, think_enabled=think_flag)
 
         async def _ollama_stream():
-            async for delta in stream_iter:
-                yield json.dumps({
-                    "model": OLLAMA_MODEL_NAME,
-                    "created_at": _now_iso(),
-                    "message": {"role": "assistant", "content": delta},
-                    "done": False,
-                }) + "\n"
+            async for item in stream_iter:
+                if isinstance(item, dict) and "thinking" in item:
+                    yield json.dumps({
+                        "model": OLLAMA_MODEL_NAME,
+                        "created_at": _now_iso(),
+                        "message": {"role": "assistant", "content": "", "thinking": item["thinking"]},
+                        "done": False,
+                    }) + "\n"
+                else:
+                    yield json.dumps({
+                        "model": OLLAMA_MODEL_NAME,
+                        "created_at": _now_iso(),
+                        "message": {"role": "assistant", "content": item},
+                        "done": False,
+                    }) + "\n"
             yield json.dumps({
                 "model": OLLAMA_MODEL_NAME,
                 "created_at": _now_iso(),
@@ -837,11 +1175,14 @@ async def chat(request: Request):
 
         return StreamingResponse(_ollama_stream(), media_type="application/x-ndjson")
     else:
-        full_text, _ = await run_pipeline(api_key, messages, stream=False)
+        full_text, _, think_summary = await run_pipeline(api_key, messages, stream=False, think_enabled=think_flag)
+        msg: dict = {"role": "assistant", "content": full_text}
+        if think_summary:
+            msg["thinking"] = think_summary
         return JSONResponse({
             "model": OLLAMA_MODEL_NAME,
             "created_at": created_at,
-            "message": {"role": "assistant", "content": full_text},
+            "message": msg,
             "done": True,
             "done_reason": "stop",
         })
@@ -849,22 +1190,24 @@ async def chat(request: Request):
 
 @app.post("/api/generate")
 async def generate(request: Request):
-    """Ollama POST /api/generate (legacy single-turn format)"""
+    """Ollama POST /api/generate (legacy single-turn format).
+
+    Used by Open WebUI for housekeeping tasks (title generation, topic summaries, etc.).
+    Routed directly to the 70B — no tool decision or reasoning pipeline.
+    """
     body = await request.json()
     api_key = _get_api_key()
     prompt: str = body.get("prompt", "")
     system: str = body.get("system", "")
     do_stream: bool = body.get("stream", True)
 
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+    messages = [{"role": "user", "content": prompt}]
+    system_prompt = system or _charter()
 
     created_at = _now_iso()
 
     if do_stream:
-        _, stream_iter = await run_pipeline(api_key, messages, stream=True)
+        stream_iter = _stream_complete_remote(api_key, system_prompt, messages)
 
         async def _ollama_gen_stream():
             async for delta in stream_iter:
@@ -883,7 +1226,7 @@ async def generate(request: Request):
 
         return StreamingResponse(_ollama_gen_stream(), media_type="application/x-ndjson")
     else:
-        full_text, _ = await run_pipeline(api_key, messages, stream=False)
+        full_text = await _complete_remote(api_key, system_prompt, messages)
         return JSONResponse({
             "model": OLLAMA_MODEL_NAME,
             "created_at": created_at,
@@ -926,6 +1269,4 @@ async def version():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 11436))
     print(f"Starting Apertus local hybrid proxy on port {port}", file=sys.stderr)
-    print(f"Reasoning + tools : {LOCAL_MODEL} (Ollama local)", file=sys.stderr)
-    print(f"Final response    : {UPSTREAM_MODEL} (PublicAI)", file=sys.stderr)
     uvicorn.run(app, host="0.0.0.0", port=port)

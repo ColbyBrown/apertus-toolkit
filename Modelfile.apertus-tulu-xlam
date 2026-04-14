@@ -1,4 +1,4 @@
-FROM /tmp/gguf-apertus/Apertus-8B-tulu-xlam-sft-q4_k_m.gguf
+FROM C:\Users\colby\.cache\huggingface\hub\models--Colby--apertus-8b-soc-gguf\snapshots\29aee5e86a46bbba3e92199eb27b45d00ab6d151\apertus-8b-soc-q4_k_m.gguf
 
 TEMPLATE """<|im_start|>system
 {{ if .Tools }}You have access to the following tools:

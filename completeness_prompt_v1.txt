@@ -1,0 +1,35 @@
+def check_complete(question: str, response: str) -> dict:
+    """
+    Check whether the assistant response fully and accurately answers the question.
+
+    Returns one of:
+      {"complete": true}
+      {"complete": false, "tool": "web_search",      "args": {"query": "..."}}
+      {"complete": false, "tool": "wikipedia_search", "args": {"topic": "..."}}
+
+    Return {"complete": false} only when the response explicitly says it lacks
+    information, or is clearly too vague to be useful. Do not return false just
+    because more detail is theoretically possible.
+    """
+    ...
+
+check_complete("What is 15 percent of 200?", "15 percent of 200 is 30.")
+# Returns: {"complete": true}
+
+check_complete("Who won the 2024 US election?", "I don't have access to real-time information, so I cannot tell you the result of the 2024 US election.")
+# Returns: {"complete": false, "tool": "web_search", "args": {"query": "2024 US election winner"}}
+
+check_complete("What is machine learning?", "Machine learning is a branch of artificial intelligence where systems learn from data to improve their performance without being explicitly programmed.")
+# Returns: {"complete": true}
+
+check_complete("Tell me about Marie Curie.", "Marie Curie was a scientist who won Nobel Prizes, but I don't have detailed information about her life and work.")
+# Returns: {"complete": false, "tool": "wikipedia_search", "args": {"topic": "Marie Curie"}}
+
+check_complete("How do I reverse a list in Python?", "You can reverse a list in Python using the reverse() method or slicing: my_list.reverse() modifies in place, while my_list[::-1] returns a new list.")
+# Returns: {"complete": true}
+
+check_complete("What is the current stock price of Apple?", "I don't have access to real-time stock prices.")
+# Returns: {"complete": false, "tool": "web_search", "args": {"query": "Apple AAPL stock price today"}}
+
+check_complete("Explain the French Revolution.", "The French Revolution was a period of radical political and societal change in France that began in 1789, but I lack detailed information to give a thorough account.")
+# Returns: {"complete": false, "tool": "wikipedia_search", "args": {"topic": "French Revolution"}}
